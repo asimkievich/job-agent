@@ -1,15 +1,14 @@
-# job-agent
+# Job Agent
 
-An experimental automation project using Playwright and Python to explore
-agentic workflows for job discovery, scraping, and structured extraction.
+This project is an experimental AI-powered job search assistant.
 
 ## Current status
-
 - Playwright smoke test working
-- Project scaffolding in place
-- Git + GitHub integration complete
+- Project scaffolding complete
 
-## Setup
+## Next steps
+- Add configuration file
+- Add first real scraping script
 
 ```bash
 python -m venv .venv
