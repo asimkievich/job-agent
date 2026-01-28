@@ -1,13 +1,16 @@
-# Python virtual environment
-.venv/
+# ---- Secrets (CRITICAL) -# ---- Secrets (CRITICAL) ----
+.env
+*.env
 
-# Python cache
+# ---- Python ----
 __pycache__/
 *.pyc
+.venv/
+.env/
 
-# VS Code settings (optional but recommended)
+# ---- VS Code ----
 .vscode/
 
-# OS junk
+# ---- OS ----
 .DS_Store
 Thumbs.db
