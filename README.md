@@ -10,7 +10,7 @@ This project is an experimental AI-powered job search assistant.
 - Add configuration file
 - Add first real scraping script
 
-## Setup
+## Setup#
 ```bash
 python -m venv .venv
 source .venv/bin/activate  # or .\.venv\Scripts\Activate.ps1 on Windows
