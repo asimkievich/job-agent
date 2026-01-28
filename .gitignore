@@ -1,12 +1,17 @@
-# ---- Secrets (CRITICAL) -# ---- Secrets (CRITICAL) ----
+# ---- Secrets (CRITICAL) ----
 .env
 *.env
+secrets*.py
 
 # ---- Python ----
 __pycache__/
 *.pyc
 .venv/
-.env/
+
+# ---- Playwright / auth state ----
+**/storage_state*.json
+**/cookies*.json
+playwright/.auth/
 
 # ---- VS Code ----
 .vscode/
