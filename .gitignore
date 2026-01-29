@@ -2,7 +2,11 @@
 data/
 runs/
 work_items/
+queue/
 *.png
+
+# ---- Private profiles / resumes ----
+profiles/
 
 # ---- Playwright auth / state ----
 *storage_state*.json
