@@ -194,7 +194,8 @@ source .venv/bin/activate      # macOS/Linux
 
 pip install -r requirements.txt
 playwright install
-python smoke_test.py```
+python smoke_test.py
+```
 
 
 ## Disclaimer
