@@ -184,7 +184,6 @@ The system is designed to evolve into a personal job search operating system.
 - ✅ Project scaffolding complete
 - 🚧 Active development
 
----
 
 ## Setup
 
@@ -197,7 +196,6 @@ pip install -r requirements.txt
 playwright install
 python smoke_test.py
 
----
 
 ## Disclaimer
 
