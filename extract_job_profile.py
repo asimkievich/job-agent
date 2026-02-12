@@ -36,6 +36,15 @@ def extract_section(text: str, start_label: str, end_labels: list[str]) -> Optio
     return rest.strip() or None
 
 
+def extract_section_first(text: str, start_labels: list[str], end_labels: list[str]) -> Optional[str]:
+    """Try multiple possible start labels and return the first matching section."""
+    for lab in start_labels:
+        sec = extract_section(text, lab, end_labels=end_labels)
+        if sec:
+            return sec
+    return None
+
+
 def extract_keywords(text: str) -> list[str]:
     # On freelancermap pages, tags often appear as single words in a block.
     # We'll grab a limited set of plausible tags from the area above "Beschreibung".
@@ -148,6 +157,55 @@ def main() -> None:
 
     OUT_PATH.write_text(json.dumps(profile, ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"OK: wrote {OUT_PATH.resolve()}")
+
+
+def extract_job_profile(title: str, body_text: str) -> Dict[str, Any]:
+    """
+    High-level extractor used by batch_run.py.
+    Works for both freelancermap page dumps and other pages.
+    """
+    text = body_text or ""
+    text_clean = clean(text)
+
+    # freelancermap Projekt-ID (robust to whitespace / newlines / colon)
+    project_id = find_first(
+        [
+            r"Projekt-ID\s*[:\n]?\s*([0-9]{4,})",
+            r"Projekt ID\s*[:\n]?\s*([0-9]{4,})",
+        ],
+        text,
+    )
+
+
+    # Try to carve out sections when possible; otherwise just keep body_text.
+    description = extract_section_first(
+        text,
+        start_labels=["Beschreibung", "Description", "Projektbeschreibung", "Project Description"],
+        end_labels=["Bewerben", "Ähnliche Projekte", "Für Freelancer", "Datenschutz", "Kontakt", "Über uns"]
+    )
+    tasks = extract_section_first(
+        text,
+        start_labels=["Aufgaben:", "Aufgaben", "Responsibilities", "Ihre Aufgaben", "Tätigkeiten"],
+        end_labels=["Anforderungen", "Requirements", "Skills", "Qualifikation", "Qualifications", "Ihr Profil",
+                    "Sprachen", "Wünschenswert", "Nice", "Bewerben", "Kontakt", "Über uns"]
+    )
+    requirements = extract_section_first(
+        text,
+        start_labels=["Anforderungen / Skills:", "Anforderungen:", "Anforderungen", "Requirements", "Skills", "Qualifications", "Ihr Profil"],
+        end_labels=["Sprachen", "Wünschenswert", "Nice", "Bewerben", "Kontakt", "Über uns", "Aufgaben"]
+    )
+
+    profile: Dict[str, Any] = {
+        "project_id": project_id,
+        "title": clean(title or ""),
+        "body_text": text_clean,
+        "keywords": extract_keywords(text),
+        "description": clean(description) if description else None,
+        "tasks": clean(tasks) if tasks else None,
+        "requirements": clean(requirements) if requirements else None,
+    }
+
+    return profile
 
 
 if __name__ == "__main__":

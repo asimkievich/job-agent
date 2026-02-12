@@ -56,7 +56,11 @@ def node_score(state: AgentState) -> AgentState:
     sim = float(util.cos_sim(emb_resume, emb_job).item())
 
     rule_norm = max(0.0, min(1.0, (rs["rule_score"] / 0.8)))
-    hybrid = 0.6 * rule_norm + 0.4 * max(0.0, min(1.0, sim))
+    
+    sim01 = max(0.0, min(1.0, sim))
+    domain_bonus = max(0.0, 1.0 - (rs["domain_distance"] / 3.0))
+
+    hybrid = min(1.0, (0.65 * sim01) + (0.35 * rule_norm) + (0.10 * domain_bonus))
 
     decision = "pursue" if hybrid >= 0.55 and rs["domain_distance"] < 3 else "skip"
 

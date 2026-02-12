@@ -27,3 +27,12 @@ __pycache__/
 # ---- OS ----
 .DS_Store
 Thumbs.db
+
+archive/
+drafts/
+runs_injected/
+
+__pycache__/
+*.bak_*
+
+
