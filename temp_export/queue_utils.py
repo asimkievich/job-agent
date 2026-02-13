@@ -43,37 +43,6 @@ def save_queue(queue: Dict[str, Any], path: Optional[Path] = None) -> None:
         encoding="utf-8",
     )
 
-def patch_queue_item(*, queue: Dict[str, Any], job_id: str, patch: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Patch/merge a queue item WITHOUT recomputing decision/status.
-    Safe for lifecycle updates during pipeline steps.
-    """
-    items = queue.setdefault("items_by_job_id", {})
-    existing = items.get(str(job_id)) or {}
-
-    # merge artifacts dicts
-    if "artifacts" in patch and isinstance(patch["artifacts"], dict):
-        merged_artifacts = dict(existing.get("artifacts") or {})
-        merged_artifacts.update(patch["artifacts"])
-        patch = dict(patch)
-        patch["artifacts"] = merged_artifacts
-
-    updated = dict(existing)
-    updated.update(patch)
-    updated["job_id"] = str(job_id)
-    updated["updated_at"] = _now_iso()
-
-    items[str(job_id)] = updated
-    return updated
-
-
-def set_lifecycle(*, queue: Dict[str, Any], job_id: str, lifecycle: str) -> Dict[str, Any]:
-    return patch_queue_item(
-        queue=queue,
-        job_id=job_id,
-        patch={"lifecycle": lifecycle, "lifecycle_updated_at": _now_iso()},
-    )
-
 
 def _coerce_float(x: Any, default: float = 0.0) -> float:
     try:
@@ -105,10 +74,9 @@ def _normalize_decision(scoring: Dict[str, Any]) -> str:
 def _status_from_decision(decision: str) -> str:
     return {
         "pursue": "pending",
-        "review": "pending",
-        "skip": "skipped",
-    }.get(decision, "pending")
-
+        "review": "hold",
+        "skip": "rejected",
+    }.get(decision, "rejected")
 
 
 def upsert_queue_item(
@@ -128,7 +96,6 @@ def upsert_queue_item(
     draft_path: Optional[str],
     run_log_path: str,
     status_override: Optional[str] = None,
-    lifecycle_override: Optional[str] = None, 
 ) -> Dict[str, Any]:
     """
     Insert/update a queue item keyed by job_id.
@@ -143,9 +110,7 @@ def upsert_queue_item(
     """
     items = queue.setdefault("items_by_job_id", {})
     existing = items.get(job_id, {})
-    lifecycle = (lifecycle_override or existing.get("lifecycle") or "").strip().lower()
-    if not lifecycle:
-        lifecycle = "discovered"
+
     scoring = scoring or {}
     top_resume_scores = top_resume_scores or []
 
@@ -179,7 +144,6 @@ def upsert_queue_item(
         "published_at": published_at,
         "status": status,
         "decision": decision,
-        "lifecycle": lifecycle,
 
         # Prefer scorer values; do NOT accept top-level copies as truth
         "selected_resume_id": scoring.get("selected_resume_id") or "default",
@@ -274,5 +238,4 @@ def enqueue_item(queue: Dict[str, Any], item: Dict[str, Any]) -> Dict[str, Any]:
         draft_path=item.get("draft_path"),
         run_log_path=item.get("run_log_path") or "",
         status_override=item.get("status"),
-        lifecycle_override=item.get("lifecycle"),
     )

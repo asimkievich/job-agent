@@ -5,8 +5,6 @@ import os
 import traceback
 import re
 from typing import Any, Dict, Optional
-import hashlib
-import job_graph
 
 from dataclasses import dataclass
 from datetime import datetime
@@ -230,40 +228,8 @@ async def fetch_body_text(page) -> str:
 
 
 # ----------------------------
-# Discovery (prod vs injected)
-# ----------------------------
-
-async def discover_jobs(*, seen: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], List[str]]:
-    """
-    Returns (jobs, notes_to_append).
-    Keeps logic identical to what used to be in main().
-    """
-    notes: List[str] = []
-
-    if USE_INJECTED:
-        if not INJECTED_PATH.exists():
-            raise FileNotFoundError(f"USE_INJECTED_JOBS=1 but {INJECTED_PATH} does not exist.")
-        payload = json.loads(INJECTED_PATH.read_text(encoding="utf-8"))
-        jobs = payload.get("jobs", [])
-        print(f"[batch_run] MODE=injected Using injected jobs: {len(jobs)} from {INJECTED_PATH}")
-        notes.append(f"Using injected jobs from {INJECTED_PATH}")
-    else:
-        jobs = await fetch_jobs.fetch_jobs_async(
-            max_jobs=FETCH_MAX_JOBS,
-            seen_urls=set(seen["seen_urls"].keys()),
-            max_pages=FETCH_MAX_PAGES,
-            stop_after_seen_streak=FETCH_STOP_AFTER_SEEN_STREAK,
-            per_page_extract_limit=FETCH_PER_PAGE_EXTRACT_LIMIT,
-            stop_if_page_new_items_leq=FETCH_STOP_IF_PAGE_NEW_ITEMS_LEQ,
-        )
-
-    return jobs, notes
-
-
-# ----------------------------
 # Extractor resolver (fixes your AttributeError)
 # ----------------------------
-
 def resolve_profile_extractor() -> Callable[..., Dict[str, Any]]:
     """
     Your code was calling extract_job_profile.extract_job_profile(...), but that function
@@ -300,84 +266,6 @@ def resolve_profile_extractor() -> Callable[..., Dict[str, Any]]:
         + ", ".join(public_callables)
     )
 
-def resolve_project_id(
-    profile: Dict[str, Any],
-    body_text: str,
-    last_job_id: Optional[str],
-) -> Optional[str]:
-
-    # 1️⃣ Try profile first (highest confidence)
-    project_id = get_project_id(profile)
-    if project_id and project_id.isdigit():
-        return project_id
-
-    # 2️⃣ Try label-based extraction
-    if body_text:
-        lines = [l.strip() for l in body_text.splitlines() if l.strip()]
-        for i, line in enumerate(lines):
-            key = line.lower().replace("-", "").replace(" ", "")
-            if key == "projektid":
-                if i + 1 < len(lines):
-                    candidate = lines[i + 1]
-                    if candidate.isdigit() and 6 <= len(candidate) <= 8:
-                        return candidate
-
-    # 3️⃣ Try ±10 heuristic (lowest confidence)
-    if body_text and last_job_id and last_job_id.isdigit():
-        last_id_int = int(last_job_id)
-        candidates = re.findall(r"\b\d{6,8}\b", body_text)
-
-        closest = None
-        min_diff = None
-
-        for c in candidates:
-            val = int(c)
-            diff = abs(val - last_id_int)
-            if diff <= 10:
-                if min_diff is None or diff < min_diff:
-                    closest = c
-                    min_diff = diff
-
-        if closest:
-            print(f"[heuristic] Using near-ID fallback: {closest}")
-            return closest
-
-    return None
-
-
-def build_job_pub(jobs: List[Dict[str, Any]]) -> Dict[str, str]:
-    job_pub: Dict[str, str] = {}
-    for j in jobs:
-        href = j.get("href")
-        if not href:
-            continue
-        u = normalize_url(href)
-        pub = (j.get("published_at") or "").strip()
-        if u:
-            job_pub[u] = pub
-    return job_pub
-
-
-def backfill_published_at(job_pub: Dict[str, str]) -> int:
-    """
-    Minimal-diff: keep your legacy loop over queue.get("items", []) exactly as before.
-    Returns updated count.
-    """
-    queue = load_queue_compat()
-    updated = 0
-
-    for item in queue.get("items", []):
-        if item.get("published_at"):
-            continue
-        u = item.get("normalized_href") or normalize_url(item.get("href", ""))
-        if u and u in job_pub and job_pub[u]:
-            item["published_at"] = job_pub[u]
-            updated += 1
-
-    if updated:
-        save_queue_compat(queue)
-
-    return updated
 
 async def process_and_enqueue(
     jobs: List[Dict[str, Any]],
@@ -388,7 +276,7 @@ async def process_and_enqueue(
     run_tags = run_tags or []
     job_pub = job_pub or {}
 
-    # NOTE: we intentionally keep "seen" loaded once and only saved at the end.
+    queue = load_queue_compat()
     seen = load_seen()
 
     enqueued = 0
@@ -409,7 +297,6 @@ async def process_and_enqueue(
             storage_state=str(AUTH_STATE_PATH) if AUTH_STATE_PATH.exists() else None
         )
         page = await context.new_page()
-        last_job_id: Optional[str] = None
 
         for j in jobs:
             href = j.get("href")
@@ -435,11 +322,13 @@ async def process_and_enqueue(
                         break
                     except Exception as e:
                         last_err = e
+                        # reset the page to avoid "interrupted by another navigation" cascades
                         try:
                             await page.close()
                         except Exception:
                             pass
                         page = await context.new_page()
+                        # small backoff (1s, 2s, 3s)
                         await page.wait_for_timeout(1000 * (attempt + 1))
 
                 if last_err is not None:
@@ -448,33 +337,22 @@ async def process_and_enqueue(
 
                 body_text = await fetch_body_text(page)
 
+
+                # Call resolved extractor. Most implementations accept (title, body_text).
+                # If yours differs, the error will now be explicit.
                 profile = extract_fn(title=title, body_text=body_text)
 
+                project_id = (
+                    profile.get("project_id")
+                    or profile.get("Projekt-ID")
+                    or profile.get("Projekt_ID")
+                    or profile.get("projekt_id")
+                    or profile.get("ProjektId")
+                    or profile.get("projectId")
+                )
 
-                project_id = resolve_project_id(profile, body_text, last_job_id)
-
-                if project_id and project_id.isdigit():
-                    last_job_id = project_id
-
-
-                #project_id = (
-                 #   profile.get("project_id")
-                  #  or profile.get("Projekt-ID")
-                   # or profile.get("Projekt_ID")
-                    #or profile.get("projekt_id")
-                   # or profile.get("ProjektId")
-               #     or profile.get("projectId")
-               # )
-
-                stable_job_id = str(project_id).strip() if project_id else None
-                if not stable_job_id:
-                    stable_job_id = _fallback_job_id_from_href(href)
-
-                # Never use the normalized URL as a filename/id on Windows.
-                if not stable_job_id:
-                    h = hashlib.sha1(u.encode("utf-8")).hexdigest()[:10]
-                    stable_job_id = f"unknown_{h}"
-
+                # Persist work items (raw + profile) for offline rescoring/debugging
+                stable_job_id = str(project_id) if project_id else (_fallback_job_id_from_href(href) or u or "unknown")
                 work_item_path, profile_path = persist_work_items(
                     job_id=stable_job_id,
                     href=href,
@@ -484,62 +362,12 @@ async def process_and_enqueue(
                     profile=profile,
                 )
 
-                stable_job_id_str = str(stable_job_id)
-
-                # 1) discovered
-                queue = load_queue_compat()
-                queue_utils.patch_queue_item(
-                    queue=queue,
-                    job_id=stable_job_id_str,
-                    patch={
-                        "source": "freelancermap",
-                        "url": href,
-                        "title": title,
-                        "captured_at": now_iso(),
-                        "published_at": (j.get("published_at") or None),
-                        "lifecycle": "discovered",
-                        "lifecycle_updated_at": now_iso(),
-                        "artifacts": {"work_item_path": work_item_path},
-                    },
-                )
-                save_queue_compat(queue)
-
-                # 2) profile_extracted
-                queue = load_queue_compat()
-                queue_utils.patch_queue_item(
-                    queue=queue,
-                    job_id=stable_job_id_str,
-                    patch={
-                        "lifecycle": "profile_extracted",
-                        "lifecycle_updated_at": now_iso(),
-                        "artifacts": {"profile_path": profile_path},
-                    },
-                )
-                save_queue_compat(queue)
 
                 scoring = score_job.score_job(
                     job_profile=profile,
                     resume_paths=resume_paths,
                     model=model,
                 )
-
-                # 3) scored
-                queue = load_queue_compat()
-                queue_utils.set_lifecycle(queue=queue, job_id=stable_job_id_str, lifecycle="scored")
-                save_queue_compat(queue)
-
-                # 4) decision -> final lifecycle
-                decision = (scoring.get("decision") or "").strip().lower()
-                if decision == "skip":
-                    final_lifecycle = "skipped"
-                elif decision in {"review", "pursue"}:
-                    final_lifecycle = "awaiting_human_decision"
-                else:
-                    final_lifecycle = "scored"
-
-                queue = load_queue_compat()
-                queue_utils.set_lifecycle(queue=queue, job_id=stable_job_id_str, lifecycle=final_lifecycle)
-                save_queue_compat(queue)
 
                 published_at = (j.get("published_at") or "").strip()
                 if not published_at and u in job_pub:
@@ -548,7 +376,7 @@ async def process_and_enqueue(
                 item = {
                     "href": href,
                     "project_id": str(project_id) if project_id else None,
-                    "job_id": stable_job_id_str,
+                    "job_id": str(project_id) if project_id else None,
                     "normalized_href": u,
                     "title": title,
                     "published_at": published_at or None,
@@ -562,18 +390,16 @@ async def process_and_enqueue(
                     "mode": "injected" if USE_INJECTED else "prod",
                     "selected_resume_id": scoring.get("selected_resume_id") or "default",
                     "top_resume_scores": scoring.get("top_resume_scores") or [],
-                    "lifecycle": final_lifecycle,
                 }
 
-
-                queue = load_queue_compat()
-                queue_utils.enqueue_item(queue, item)
+                enqueue_item_compat(queue, item)
                 save_queue_compat(queue)
 
                 seen["seen_urls"][u] = {"seen_at": now_iso(), "run_id": run_id}
                 enqueued += 1
                 processed += 1
 
+                # Draft generation failures should NOT count as job failures
                 try:
                     prepare_application_draft.maybe_prepare_application_draft(item)
                 except Exception as e:
@@ -584,13 +410,13 @@ async def process_and_enqueue(
                 failed += 1
                 print(f"[batch_run] FAIL href={href} err={type(e).__name__}: {e}", flush=True)
                 print(traceback.format_exc(), flush=True)
+                # Do not mark seen on failure (allows retry)
 
         await context.close()
         await browser.close()
 
     save_seen(seen)
     return enqueued, skipped_seen, processed, failed
-
 
 
 async def main() -> None:
@@ -600,17 +426,46 @@ async def main() -> None:
     mode = "injected" if USE_INJECTED else "prod"
 
     seen = load_seen()
-    # 1) Discover jobs (prod or injected)
-    jobs, discover_notes = await discover_jobs(seen=seen)
-    notes.extend(discover_notes)
 
-    # 2) Build published_at lookup + backfill legacy queue items
-    job_pub = build_job_pub(jobs)
-    updated = backfill_published_at(job_pub)
+    if USE_INJECTED:
+        if not INJECTED_PATH.exists():
+            raise FileNotFoundError(f"USE_INJECTED_JOBS=1 but {INJECTED_PATH} does not exist.")
+        payload = json.loads(INJECTED_PATH.read_text(encoding="utf-8"))
+        jobs = payload.get("jobs", [])
+        print(f"[batch_run] MODE=injected Using injected jobs: {len(jobs)} from {INJECTED_PATH}")
+        notes.append(f"Using injected jobs from {INJECTED_PATH}")
+    else:
+        jobs = await fetch_jobs.fetch_jobs_async(
+            max_jobs=FETCH_MAX_JOBS,
+            seen_urls=set(seen["seen_urls"].keys()),
+            max_pages=FETCH_MAX_PAGES,
+            stop_after_seen_streak=FETCH_STOP_AFTER_SEEN_STREAK,
+            per_page_extract_limit=FETCH_PER_PAGE_EXTRACT_LIMIT,
+            stop_if_page_new_items_leq=FETCH_STOP_IF_PAGE_NEW_ITEMS_LEQ,
+        )
+
+    job_pub: Dict[str, str] = {}
+    for j in jobs:
+        href = j.get("href")
+        if not href:
+            continue
+        u = normalize_url(href)
+        pub = (j.get("published_at") or "").strip()
+        if u:
+            job_pub[u] = pub
+
+    queue = load_queue_compat()
+    updated = 0
+    for item in queue.get("items", []):
+        if item.get("published_at"):
+            continue
+        u = item.get("normalized_href") or normalize_url(item.get("href", ""))
+        if u and u in job_pub and job_pub[u]:
+            item["published_at"] = job_pub[u]
+            updated += 1
     if updated:
+        save_queue_compat(queue)
         notes.append(f"Backfilled published_at for {updated} queued items")
-
-    
 
     enq, skipped_seen, processed, failed = await process_and_enqueue(
         jobs=jobs,

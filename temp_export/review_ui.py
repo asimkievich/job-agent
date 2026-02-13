@@ -15,13 +15,10 @@ import json
 import os
 import re
 import tempfile
-import prepare_application_draft
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
-from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
 
 import streamlit as st
 
@@ -155,21 +152,17 @@ class QueueItem:
     published_at: str
     status: str
     decision: str
+    scores: Dict[str, Any]
+    reasons: List[str]
+    selected_resume_id: str
+    top_resume_scores: List[Dict[str, Any]]
+    artifacts: Dict[str, Any]
 
-    lifecycle: str = ""
-    scores: Dict[str, Any] = field(default_factory=dict)
-
-    reasons: List[str] = field(default_factory=list)
-    selected_resume_id: str = ""
-    top_resume_scores: List[Dict[str, Any]] = field(default_factory=list)
-    artifacts: Dict[str, Any] = field(default_factory=dict)
-
-    # optional/human fields
+    # defaulted fields must come last (dataclass rule)
     viewed_at: str = ""
     human_notes: str = ""
     approved_at: str = ""
     rejected_at: str = ""
-  
 
 
 def parse_queue_item(job_id: str, raw: Dict[str, Any]) -> QueueItem:
@@ -182,14 +175,17 @@ def parse_queue_item(job_id: str, raw: Dict[str, Any]) -> QueueItem:
         updated_at=raw.get("updated_at", ""),
         published_at=raw.get("published_at", "") or "",
         status=raw.get("status", "pending"),
-        decision=raw.get("decision", "") or "",
-        lifecycle=raw.get("lifecycle", "") or "",
+        decision=raw.get("decision", ""),
         scores=raw.get("scores", {}) if isinstance(raw.get("scores", {}), dict) else {},
         reasons=raw.get("reasons", []) if isinstance(raw.get("reasons", []), list) else [],
+        selected_resume_id=raw.get("selected_resume_id", ""),
         top_resume_scores=raw.get("top_resume_scores", []) if isinstance(raw.get("top_resume_scores", []), list) else [],
         artifacts=raw.get("artifacts", {}) if isinstance(raw.get("artifacts", {}), dict) else {},
+        viewed_at=raw.get("viewed_at", "") or "",
+        human_notes=raw.get("human_notes", "") or "",
+        approved_at=raw.get("approved_at", "") or "",
+        rejected_at=raw.get("rejected_at", "") or "",
     )
-
 
 
 def is_viewed(it: QueueItem) -> bool:
@@ -390,23 +386,6 @@ def update_item_viewed(queue_doc: Dict[str, Any], job_id: str) -> None:
     queue_doc.setdefault("meta", {})
     queue_doc["meta"]["updated_at"] = ts
 
-def update_item_lifecycle(queue_doc: Dict[str, Any], job_id: str, new_lifecycle: str) -> None:
-    items_by_job_id = queue_doc.setdefault("items_by_job_id", {})
-    it = items_by_job_id.setdefault(job_id, {})
-    it["lifecycle"] = new_lifecycle
-    it["updated_at"] = now_iso()
-    queue_doc.setdefault("meta", {})
-    queue_doc["meta"]["updated_at"] = now_iso()
-
-
-def set_item_draft_path(queue_doc: Dict[str, Any], job_id: str, draft_path: str) -> None:
-    items_by_job_id = queue_doc.setdefault("items_by_job_id", {})
-    it = items_by_job_id.setdefault(job_id, {})
-    art = it.setdefault("artifacts", {})
-    art["draft_path"] = draft_path
-    it["updated_at"] = now_iso()
-    queue_doc.setdefault("meta", {})
-    queue_doc["meta"]["updated_at"] = now_iso()
 
 # -----------------------------
 # Sidebar (filters)
@@ -461,12 +440,6 @@ with st.sidebar:
         index=0,
     )
 
-    lifecycle_filter = st.selectbox(
-    "Lifecycle",
-    ["all", "awaiting_human_decision", "awaiting_final_review", "skipped", "(blank)"],
-    index=0,
-    )
-
     search = st.text_input("Search (title/url/job_id/resume)", "")
 
     st.divider()
@@ -509,15 +482,6 @@ for it in items:
                 continue
         elif dec != decision_filter:
             continue
-    
-    lc = (it.lifecycle or "").strip()
-    if lifecycle_filter != "all":
-        if lifecycle_filter == "(blank)":
-            if lc != "":
-                continue
-        elif lc != lifecycle_filter:
-            continue
-
 
     if not matches_search(it, search):
         continue
@@ -639,9 +603,7 @@ def render_header(it: QueueItem, idx: int, total: int) -> None:
         f"Source: <b>{source}</b> • "
         f"Published: <b>{pub_txt}</b> • "
         f"Item <b>{idx+1}</b> / <b>{total}</b> • "
-        f"Status: <b>{it.status}</b> • "
-        f"Lifecycle: <b>{it.lifecycle or '—'}</b>"
-
+        f"Status: <b>{it.status}</b>"
     )
     st.markdown(f"<div class='header-meta'>{meta}</div>", unsafe_allow_html=True)
 
@@ -723,11 +685,6 @@ with tab_overview:
         else:
             st.markdown("<div class='kv-value'>🟢 New</div>", unsafe_allow_html=True)
 
-    with c10:
-        st.markdown("<div class='kv-label'>Lifecycle</div>", unsafe_allow_html=True)
-        st.markdown(f"<div class='kv-value'>{item.lifecycle or '—'}</div>", unsafe_allow_html=True)
-
-
     # c10 intentionally left empty to preserve alignment
 
     with st.expander("Show reasons", expanded=False):
@@ -807,58 +764,8 @@ with tab_actions:
 
     with b2:
         if st.button("Approve", use_container_width=True):
-            with st.spinner("Generating draft..."):
-
-                items_by_job_id = queue_doc.setdefault("items_by_job_id", {})
-                raw = items_by_job_id.get(item.job_id, {}) or {}
-
-                # Build payload
-                payload = dict(raw)
-                payload.setdefault("job_id", item.job_id)
-                payload.setdefault("title", item.title)
-                payload.setdefault("url", item.url)
-                payload.setdefault("href", item.url)
-                payload.setdefault("source", item.source)
-                payload.setdefault("scoring", raw.get("scoring") or {})
-                payload.setdefault("decision", raw.get("decision") or item.decision)
-                # ✅ Pass the selected resume into the draft generator (prevents fallback to old default)
-
-                sel = (raw.get("selected_resume_id") or "").strip()
-                if sel:
-                    payload.setdefault("scoring", {})
-                    payload["scoring"]["resume_path"] = str(Path("profiles") / "resumes" / sel)
-
-
-
-                # Human approval forces pursue
-                payload["decision"] = "pursue"
-                payload["scoring"]["decision"] = "pursue"
-
-                try:
-                    draft_path = prepare_application_draft.maybe_prepare_application_draft(payload)
-                except Exception as e:
-                    st.error(f"Draft generation failed: {e}")
-                    # DO NOT change status
-                    # DO NOT change lifecycle
-                    atomic_write_json(queue_path, queue_doc)
-                    st.stop()
-
-                if not draft_path:
-                    st.error("Draft generator returned no draft_path.")
-                    atomic_write_json(queue_path, queue_doc)
-                    st.stop()
-
-                # ✅ Only now mark as approved
-                update_item_status(queue_doc, item.job_id, "approved")
-
-                # Persist draft
-                set_item_draft_path(queue_doc, item.job_id, str(draft_path))
-
-                # Move lifecycle
-                update_item_lifecycle(queue_doc, item.job_id, "awaiting_final_review")
-
-                atomic_write_json(queue_path, queue_doc)
-
+            update_item_status(queue_doc, item.job_id, "approved")
+            atomic_write_json(queue_path, queue_doc)
             request_advance(1)
 
     with b3:

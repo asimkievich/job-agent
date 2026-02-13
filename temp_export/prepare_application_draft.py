@@ -10,9 +10,8 @@ import queue_utils
 
 
 WORK_ITEM = Path("work_items/job_001.json")
+RESUME_PROFILE = Path("profiles/resumes/resume_product_owner_ai_pm.json")
 OUT_PATH = Path("work_items/job_001.application_draft.json")
-RESUMES_DIR = Path("profiles") / "resumes"
-
 
 
 GERMAN_MARKERS = [
@@ -24,32 +23,6 @@ ENGLISH_MARKERS = [
     "responsibilities", "requirements", "apply", "contract", "remote",
     "experience", "skills", "english", "we are looking for", "role", "must have"
 ]
-
-def resolve_resume_path(payload: dict) -> Path:
-    # 1️⃣ Prefer explicitly selected resume
-    selected = (
-        payload.get("selected_resume_id")
-        or payload.get("resume_id")
-        or (payload.get("scoring") or {}).get("selected_resume_id")
-        or (payload.get("scoring") or {}).get("resume_id")
-    )
-
-    resumes_dir = Path("profiles") / "resumes"
-
-    if selected:
-        candidate = resumes_dir / selected
-        if candidate.exists():
-            return candidate
-
-    # 2️⃣ Fallback: pick first available resume (safe fallback)
-    available = list(resumes_dir.glob("*.json"))
-    if not available:
-        raise FileNotFoundError("No resume JSON files found in profiles/resumes")
-
-    return available[0]
-
-
-
 
 
 def detect_language(text: str) -> str:
@@ -86,7 +59,8 @@ def _choose_draft_dir(mode: str) -> Path:
     return d
 
 
-def _load_resume_for_item(item: dict) -> dict:
+def _load_resume_for_item(item: Dict[str, Any]) -> Dict[str, Any]:
+    # Prefer resume path provided by scoring, fall back to default RESUME_PROFILE.
     scoring = item.get("scoring") or {}
     resume_path = scoring.get("resume_path")
 
@@ -95,13 +69,8 @@ def _load_resume_for_item(item: dict) -> dict:
         if p.exists():
             return json.loads(p.read_text(encoding="utf-8"))
 
-    # ✅ Robust fallback: pick the first available resume JSON
-    resumes = sorted(RESUMES_DIR.glob("*.json"))
-    if not resumes:
-        raise FileNotFoundError(f"No resume JSON files found in {RESUMES_DIR}")
-
-    return json.loads(resumes[0].read_text(encoding="utf-8"))
-
+    # fallback
+    return json.loads(RESUME_PROFILE.read_text(encoding="utf-8"))
 
 
 def _openai_client() -> OpenAI:
