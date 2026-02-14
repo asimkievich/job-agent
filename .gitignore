@@ -3,6 +3,7 @@ data/
 runs/
 work_items/
 queue/
+applications/
 *.png
 
 # ---- Private profiles / resumes ----
