@@ -22,15 +22,15 @@ def now_iso() -> str:
 
 
 def load_queue() -> Dict[str, Any]:
-    if QUEUE_PATH.exists():
-        return json.loads(QUEUE_PATH.read_text(encoding="utf-8"))
+    if QUEUE_DB_PATH.exists():
+        return json.loads(QUEUE_DB_PATH.read_text(encoding="utf-8"))
     return {"meta": {"created_at": now_iso(), "updated_at": now_iso(), "version": 1}, "items_by_job_id": {}}
 
 
 def save_queue(doc: Dict[str, Any]) -> None:
     meta = doc.setdefault("meta", {})
     meta["updated_at"] = now_iso()
-    QUEUE_PATH.write_text(json.dumps(doc, ensure_ascii=False, indent=2), encoding="utf-8")
+    QUEUE_DB_PATH.write_text(json.dumps(doc, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 def normalize_lifecycle(doc: Dict[str, Any]) -> int:
