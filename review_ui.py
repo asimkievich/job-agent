@@ -15,7 +15,6 @@ import json
 import os
 import re
 import tempfile
-import prepare_application_draft
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
