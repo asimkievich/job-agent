@@ -19,7 +19,6 @@ from playwright.async_api import async_playwright
 
 import extract_job_profile
 import fetch_jobs
-import prepare_application_draft
 import score_job
 import queue_utils
 import config
