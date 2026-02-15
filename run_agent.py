@@ -8,7 +8,8 @@ from typing import Any, Dict
 
 import batch_run
 
-QUEUE_PATH = Path("queue/queue.json")
+USE_INJECTED = os.getenv("USE_INJECTED_JOBS", "0") == "1"
+QUEUE_DB_PATH = Path("queue/queue_injected.db" if USE_INJECTED else "queue/queue.db")
 RUNS_DIR = Path("runs")
 RUNS_DIR.mkdir(exist_ok=True)
 

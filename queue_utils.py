@@ -4,75 +4,48 @@ import json
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Optional, List
+import queue_db
 
 QUEUE_DIR = Path("queue")
-QUEUE_PATH = QUEUE_DIR / "queue.json"
-
 ALLOWED_DECISIONS = {"pursue", "review", "skip"}
 
 
 def _now_iso() -> str:
     return datetime.now().astimezone().isoformat()
 
-
-def _ensure_queue_dir() -> None:
-    QUEUE_DIR.mkdir(exist_ok=True)
-
-
-def load_queue(path: Optional[Path] = None) -> Dict[str, Any]:
-    _ensure_queue_dir()
-    p = path or QUEUE_PATH
-    if not p.exists():
-        return {
-            "meta": {
-                "created_at": _now_iso(),
-                "updated_at": _now_iso(),
-                "version": 1,
-            },
-            "items_by_job_id": {},
-        }
-    return json.loads(p.read_text(encoding="utf-8"))
+def load_queue(*, db_path: Path) -> Dict[str, Any]:
+    # Return same structure as before so callers don’t break.
+    items = queue_db.list_items(db_path)
+    return {
+        "meta": {"created_at": _now_iso(), "updated_at": _now_iso(), "version": 1},
+        "items_by_job_id": items,
+    }
 
 
-def save_queue(queue: Dict[str, Any], path: Optional[Path] = None) -> None:
-    _ensure_queue_dir()
-    queue.setdefault("meta", {})
-    queue["meta"]["updated_at"] = _now_iso()
-    (path or QUEUE_PATH).write_text(
-        json.dumps(queue, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
+def save_queue(queue: Dict[str, Any], *, db_path: Path) -> None:
+    # Persist all items currently in queue dict (used rarely; prefer enqueue_item/upsert)
+    items = queue.get("items_by_job_id") or {}
+    if not isinstance(items, dict):
+        return
+    for _, item in items.items():
+        if isinstance(item, dict):
+            queue_db.upsert_item(db_path, item)
 
-def patch_queue_item(*, queue: Dict[str, Any], job_id: str, patch: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Patch/merge a queue item WITHOUT recomputing decision/status.
-    Safe for lifecycle updates during pipeline steps.
-    """
-    items = queue.setdefault("items_by_job_id", {})
-    existing = items.get(str(job_id)) or {}
-
-    # merge artifacts dicts
-    if "artifacts" in patch and isinstance(patch["artifacts"], dict):
-        merged_artifacts = dict(existing.get("artifacts") or {})
-        merged_artifacts.update(patch["artifacts"])
-        patch = dict(patch)
-        patch["artifacts"] = merged_artifacts
-
-    updated = dict(existing)
-    updated.update(patch)
-    updated["job_id"] = str(job_id)
-    updated["updated_at"] = _now_iso()
-
-    items[str(job_id)] = updated
+def patch_queue_item(*, db_path: Path, job_id: str, patch: Dict[str, Any]) -> Dict[str, Any]:
+    updated = queue_db.patch_item(db_path, job_id, patch)
+    if not updated:
+        raise KeyError(f"patch_queue_item: job_id not found: {job_id}")
     return updated
 
 
-def set_lifecycle(*, queue: Dict[str, Any], job_id: str, lifecycle: str) -> Dict[str, Any]:
+
+def set_lifecycle(*, db_path: Path, job_id: str, lifecycle: str) -> Dict[str, Any]:
     return patch_queue_item(
-        queue=queue,
+        db_path=db_path,
         job_id=job_id,
         patch={"lifecycle": lifecycle, "lifecycle_updated_at": _now_iso()},
     )
+
 
 
 def _coerce_float(x: Any, default: float = 0.0) -> float:
@@ -224,10 +197,11 @@ def upsert_queue_item(
     return item
 
 
-def enqueue_item(queue: Dict[str, Any], item: Dict[str, Any]) -> Dict[str, Any]:
+def enqueue_item(*, db_path: Path, queue: Dict[str, Any], item: Dict[str, Any]) -> Dict[str, Any]:
     """Adapter used by batch_run.py.
 
-    Converts the generic item dict produced by batch_run into the canonical queue schema.
+    Converts the generic item dict produced by batch_run into the canonical queue schema,
+    then persists it to SQLite (queue.db / queue_injected.db).
     """
     # Robust job_id extraction
     job_id = (
@@ -258,7 +232,7 @@ def enqueue_item(queue: Dict[str, Any], item: Dict[str, Any]) -> Dict[str, Any]:
         or []
     )
 
-    return upsert_queue_item(
+    item_dict = upsert_queue_item(
         queue=queue,
         job_id=str(job_id),
         source=item.get("source") or "freelancermap",
@@ -276,3 +250,7 @@ def enqueue_item(queue: Dict[str, Any], item: Dict[str, Any]) -> Dict[str, Any]:
         status_override=item.get("status"),
         lifecycle_override=item.get("lifecycle"),
     )
+
+    # NEW: persist to SQLite
+    queue_db.upsert_item(db_path, item_dict)
+    return item_dict

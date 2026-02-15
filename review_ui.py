@@ -10,7 +10,7 @@ Job Agent — Review UI (Streamlit)
 """
 
 from __future__ import annotations
-
+import queue_db
 import json
 import os
 import re
@@ -21,6 +21,8 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
+from ui_replay import generate_and_attach_draft  # put this near your other imports
+
 
 import streamlit as st
 
@@ -29,7 +31,7 @@ import streamlit as st
 # Config
 # -----------------------------
 
-DEFAULT_QUEUE_PATH = Path("queue") / "queue.json"
+DEFAULT_QUEUE_DB_PATH = Path("queue") / "queue.db"
 ALLOWED_STATUSES = ["pending", "hold", "rejected", "approved"]
 
 ACCENT = "#2563EB"  # blue-600
@@ -170,7 +172,6 @@ class QueueItem:
     rejected_at: str = ""
   
 
-
 def parse_queue_item(job_id: str, raw: Dict[str, Any]) -> QueueItem:
     return QueueItem(
         job_id=job_id,
@@ -185,8 +186,13 @@ def parse_queue_item(job_id: str, raw: Dict[str, Any]) -> QueueItem:
         lifecycle=raw.get("lifecycle", "") or "",
         scores=raw.get("scores", {}) if isinstance(raw.get("scores", {}), dict) else {},
         reasons=raw.get("reasons", []) if isinstance(raw.get("reasons", []), list) else [],
+        selected_resume_id=raw.get("selected_resume_id", "") or "",
         top_resume_scores=raw.get("top_resume_scores", []) if isinstance(raw.get("top_resume_scores", []), list) else [],
         artifacts=raw.get("artifacts", {}) if isinstance(raw.get("artifacts", {}), dict) else {},
+        viewed_at=raw.get("viewed_at", "") or "",
+        human_notes=raw.get("human_notes", "") or "",
+        approved_at=raw.get("approved_at", "") or "",
+        rejected_at=raw.get("rejected_at", "") or "",
     )
 
 
@@ -308,21 +314,15 @@ button[data-testid="stHeaderActionElements"] {{
 # Queue load
 # -----------------------------
 
-def load_queue(queue_path: Path) -> tuple[Dict[str, Any], Dict[str, QueueItem]]:
-    if not queue_path.exists():
-        stub = {
-            "meta": {"created_at": now_iso(), "updated_at": now_iso(), "version": 1},
-            "items_by_job_id": {},
-        }
-        atomic_write_json(queue_path, stub)
+def load_queue(db_path: Path) -> tuple[Dict[str, Any], Dict[str, QueueItem]]:
+    # DB is source of truth; build the same in-memory structure UI expects
+    items_raw = queue_db.list_items(db_path)
+    q = {"meta": {"created_at": now_iso(), "updated_at": now_iso(), "version": 1}, "items_by_job_id": items_raw}
 
-    q = load_json(queue_path)
-    items_raw = q.get("items_by_job_id", {}) if isinstance(q, dict) else {}
     items: Dict[str, QueueItem] = {}
-    if isinstance(items_raw, dict):
-        for job_id, raw in items_raw.items():
-            if isinstance(raw, dict):
-                items[job_id] = parse_queue_item(job_id, raw)
+    for job_id, raw in items_raw.items():
+        if isinstance(raw, dict):
+            items[job_id] = parse_queue_item(job_id, raw)
     return q, items
 
 
@@ -420,25 +420,25 @@ with st.sidebar:
     queue_dir.mkdir(parents=True, exist_ok=True)
 
     queue_files = sorted(
-        [
-            p for p in queue_dir.iterdir()
-            if p.is_file()
-            and "queue" in p.name.lower()
-            and p.suffix.lower() == ".json"          # only clean .json
-        ],
-        key=lambda p: p.name.lower(),
+    [
+        p for p in queue_dir.iterdir()
+        if p.is_file()
+        and "queue" in p.name.lower()
+        and p.suffix.lower() == ".db"
+    ],
+    key=lambda p: p.name.lower(),
     )
 
-    queue_options = [p.stem for p in queue_files]  # drop ".json"
+    queue_options = [p.name for p in queue_files]  # keep full filename, e.g. queue.db
     if not queue_options:
-        st.error("No queue*.json files found under ./queue")
+        st.error("No queue*.db files found under ./queue (expected queue.db / queue_injected.db)")
         st.stop()
 
-    default_stem = DEFAULT_QUEUE_PATH.stem  # "queue"
-    default_idx = queue_options.index(default_stem) if default_stem in queue_options else 0
+    default_name = DEFAULT_QUEUE_DB_PATH.name  # "queue.db"
+    default_idx = queue_options.index(default_name) if default_name in queue_options else 0
 
-    selected_queue_stem = st.selectbox("Queue file", queue_options, index=default_idx)
-    queue_path = queue_dir / f"{selected_queue_stem}.json"
+    selected_queue_name = st.selectbox("Queue DB", queue_options, index=default_idx)
+    queue_db_path = queue_dir / selected_queue_name
 
 
     status_filter = st.selectbox("Status", ["all"] + ALLOWED_STATUSES, index=0)
@@ -469,10 +469,11 @@ with st.sidebar:
     search = st.text_input("Search (title/url/job_id/resume)", "")
 
     st.divider()
-    st.caption("Tip: Keep this local. queue.json and artifacts are private.")
+    st.caption("Tip: Keep this local. queue.db and artifacts are private.")
 
 
-queue_doc, items_map = load_queue(queue_path)
+
+queue_doc, items_map = load_queue(queue_db_path)
 items = list(items_map.values())
 
 
@@ -586,8 +587,16 @@ item = filtered[selected_idx]
 # Mark selected job as viewed (only write when it changes)
 if not is_viewed(item):
     update_item_viewed(queue_doc, item.job_id)
-    atomic_write_json(queue_path, queue_doc)
+    queue_db.patch_item(
+        queue_db_path,
+        item.job_id,
+        {
+            "viewed_at": queue_doc.get("items_by_job_id", {}).get(item.job_id, {}).get("viewed_at", ""),
+            "updated_at": now_iso(),
+        },
+    )
     item.viewed_at = queue_doc.get("items_by_job_id", {}).get(item.job_id, {}).get("viewed_at", "")
+
 
 # Precompute "next unseen"
 next_unseen = None
@@ -605,7 +614,8 @@ top_l, top_r = st.columns([0.72, 0.28], vertical_alignment="center")
 with top_l:
     st.title("Job Agent — Review UI")
 with top_r:
-    st.caption(f"Queue: {truncate(str(queue_path), 60)}")
+    st.caption(f"Queue DB: {truncate(str(queue_db_path), 60)}")
+
 
 
 # -----------------------------
@@ -801,75 +811,43 @@ with tab_actions:
     with b1:
         if st.button("Save notes", use_container_width=True):
             update_item_notes(queue_doc, item.job_id, st.session_state[notes_key])
-            atomic_write_json(queue_path, queue_doc)
+            queue_db.patch_item(queue_db_path, item.job_id, {"status": "hold", "updated_at": now_iso()})
             st.success("Notes saved.")
+
+    from ui_replay import generate_and_attach_draft  # put this near your other imports
+
 
     with b2:
         if st.button("Approve", use_container_width=True):
             with st.spinner("Generating draft..."):
-
-                items_by_job_id = queue_doc.setdefault("items_by_job_id", {})
-                raw = items_by_job_id.get(item.job_id, {}) or {}
-
-                # Build payload
-                payload = dict(raw)
-                payload.setdefault("job_id", item.job_id)
-                payload.setdefault("title", item.title)
-                payload.setdefault("url", item.url)
-                payload.setdefault("href", item.url)
-                payload.setdefault("source", item.source)
-                payload.setdefault("scoring", raw.get("scoring") or {})
-                payload.setdefault("decision", raw.get("decision") or item.decision)
-                # ✅ Pass the selected resume into the draft generator (prevents fallback to old default)
-
-                sel = (raw.get("selected_resume_id") or "").strip()
-                if sel:
-                    payload.setdefault("scoring", {})
-                    payload["scoring"]["resume_path"] = str(Path("profiles") / "resumes" / sel)
-
-
-
-                # Human approval forces pursue
-                payload["decision"] = "pursue"
-                payload["scoring"]["decision"] = "pursue"
-
-                try:
-                    draft_path = prepare_application_draft.maybe_prepare_application_draft(payload)
-                except Exception as e:
-                    st.error(f"Draft generation failed: {e}")
-                    # DO NOT change status
-                    # DO NOT change lifecycle
-                    atomic_write_json(queue_path, queue_doc)
-                    st.stop()
+                draft_path = generate_and_attach_draft(queue_doc, item.job_id, force=True)
 
                 if not draft_path:
-                    st.error("Draft generator returned no draft_path.")
-                    atomic_write_json(queue_path, queue_doc)
+                    st.error("Draft generation returned no draft_path.")
+                    queue_db.patch_item(queue_db_path, item.job_id, {"updated_at": now_iso()})
                     st.stop()
 
-                # ✅ Only now mark as approved
                 update_item_status(queue_doc, item.job_id, "approved")
-
-                # Persist draft
                 set_item_draft_path(queue_doc, item.job_id, str(draft_path))
-
-                # Move lifecycle
                 update_item_lifecycle(queue_doc, item.job_id, "awaiting_final_review")
 
-                atomic_write_json(queue_path, queue_doc)
+                # Persist full updated item
+                queue_db.upsert_item(queue_db_path, queue_doc["items_by_job_id"][item.job_id])
 
             request_advance(1)
+
+
 
     with b3:
         if st.button("Hold", use_container_width=True):
             update_item_status(queue_doc, item.job_id, "hold")
-            atomic_write_json(queue_path, queue_doc)
+            queue_db.patch_item(queue_db_path, item.job_id, {"status": "hold", "updated_at": now_iso()})
             request_advance(1)
 
     with b4:
         if st.button("Reject", use_container_width=True):
             update_item_status(queue_doc, item.job_id, "rejected")
-            atomic_write_json(queue_path, queue_doc)
+            queue_db.patch_item(queue_db_path, item.job_id, {"status": "hold", "updated_at": now_iso()})
             request_advance(1)
 
 

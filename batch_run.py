@@ -32,13 +32,13 @@ USE_INJECTED = os.getenv("USE_INJECTED_JOBS", "0") == "1"
 INJECTED_PATH = Path("data/injected_jobs.json")
 
 SEEN_PATH = Path("data/seen_jobs_injected.json" if USE_INJECTED else "data/seen_jobs.json")
-QUEUE_PATH = Path("queue/queue_injected.json" if USE_INJECTED else "queue/queue.json")
+QUEUE_DB_PATH = Path("queue/queue_injected.db" if USE_INJECTED else "queue/queue.db")
 RUNS_DIR = Path("runs_injected" if USE_INJECTED else "runs")
 
 AUTH_STATE_PATH = Path.home() / "secrets" / "job-agent.storage_state.json"
 
 Path("data").mkdir(exist_ok=True)
-QUEUE_PATH.parent.mkdir(exist_ok=True)
+QUEUE_DB_PATH.parent.mkdir(exist_ok=True)
 RUNS_DIR.mkdir(exist_ok=True)
 
 WORK_ITEMS_DIR = Path("work_items")
@@ -173,35 +173,13 @@ def save_seen(seen: Dict[str, Any]) -> None:
 # Queue IO (compat shim)
 # ----------------------------
 def load_queue_compat() -> Dict[str, Any]:
-    try:
-        return queue_utils.load_queue(path=QUEUE_PATH)  # type: ignore[arg-type]
-    except TypeError:
-        if QUEUE_PATH.exists():
-            return json.loads(QUEUE_PATH.read_text(encoding="utf-8"))
-        return {"items": []}
-    except Exception:
-        if QUEUE_PATH.exists():
-            return json.loads(QUEUE_PATH.read_text(encoding="utf-8"))
-        return {"items": []}
-
+    return queue_utils.load_queue(db_path=QUEUE_DB_PATH)
 
 def save_queue_compat(queue: Dict[str, Any]) -> None:
-    try:
-        queue_utils.save_queue(queue, path=QUEUE_PATH)  # type: ignore[arg-type]
-    except TypeError:
-        QUEUE_PATH.write_text(json.dumps(queue, ensure_ascii=False, indent=2), encoding="utf-8")
-    except Exception:
-        QUEUE_PATH.write_text(json.dumps(queue, ensure_ascii=False, indent=2), encoding="utf-8")
-
+    queue_utils.save_queue(queue, db_path=QUEUE_DB_PATH)
 
 def enqueue_item_compat(queue: Dict[str, Any], item: Dict[str, Any]) -> None:
-    try:
-        queue_utils.enqueue_item(queue, item)
-        return
-    except Exception:
-        pass
-    queue.setdefault("items", [])
-    queue["items"].append(item)
+    queue_utils.enqueue_item(db_path=QUEUE_DB_PATH, queue=queue, item=item)
 
 
 def discover_resume_paths() -> List[Path]:
@@ -356,28 +334,6 @@ def build_job_pub(jobs: List[Dict[str, Any]]) -> Dict[str, str]:
             job_pub[u] = pub
     return job_pub
 
-
-def backfill_published_at(job_pub: Dict[str, str]) -> int:
-    """
-    Minimal-diff: keep your legacy loop over queue.get("items", []) exactly as before.
-    Returns updated count.
-    """
-    queue = load_queue_compat()
-    updated = 0
-
-    for item in queue.get("items", []):
-        if item.get("published_at"):
-            continue
-        u = item.get("normalized_href") or normalize_url(item.get("href", ""))
-        if u and u in job_pub and job_pub[u]:
-            item["published_at"] = job_pub[u]
-            updated += 1
-
-    if updated:
-        save_queue_compat(queue)
-
-    return updated
-
 async def process_and_enqueue(
     jobs: List[Dict[str, Any]],
     run_id: str,
@@ -410,7 +366,7 @@ async def process_and_enqueue(
         page = await context.new_page()
         last_job_id: Optional[str] = None
 
-                # ---- LangGraph nodes (v1) ----
+        # ---- LangGraph nodes (v1) ----
 
         async def node_capture(state: job_graph.JobState) -> Dict[str, Any]:
             href = state["href"]
@@ -527,8 +483,8 @@ async def process_and_enqueue(
             }
 
             queue = load_queue_compat()
-            queue_utils.enqueue_item(queue, item)   # canonical schema converter
-            save_queue_compat(queue)
+            queue_utils.enqueue_item(db_path=QUEUE_DB_PATH, queue=queue, item=item)
+
 
             seen["seen_urls"][state["normalized_href"]] = {"seen_at": now_iso(), "run_id": state.get("run_id")}
             return {}
@@ -551,10 +507,6 @@ async def process_and_enqueue(
 
             u = normalize_url(href)
             if not u:
-                continue
-
-            if u in seen.get("seen_urls", {}):
-                skipped_seen += 1
                 continue
             
             if u in seen.get("seen_urls", {}):
@@ -618,11 +570,9 @@ async def main() -> None:
     jobs, discover_notes = await discover_jobs(seen=seen)
     notes.extend(discover_notes)
 
-    # 2) Build published_at lookup + backfill legacy queue items
+    # 2) Build published_at lookup (legacy backfill removed once queue is DB-backed)
     job_pub = build_job_pub(jobs)
-    updated = backfill_published_at(job_pub)
-    if updated:
-        notes.append(f"Backfilled published_at for {updated} queued items")
+    
 
     
 
@@ -664,8 +614,9 @@ async def main() -> None:
 
     print(
         f"[batch_run] MODE={mode} run_id={run_id} jobs={len(jobs)} "
-        f"enqueued={enq} failed={failed} queue={QUEUE_PATH} seen={SEEN_PATH} summary={summary_path}"
+        f"enqueued={enq} failed={failed} queue_db={QUEUE_DB_PATH} seen={SEEN_PATH} summary={summary_path}"
     )
+
 
 
 if __name__ == "__main__":

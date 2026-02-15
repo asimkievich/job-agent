@@ -2,14 +2,17 @@
 import asyncio
 import json
 import re
+import queue_db
 from pathlib import Path
-import json
+from typing import Set
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
-from playwright.async_api import async_playwright
-from time_utils import parse_published_at
+
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
+from playwright.async_api import async_playwright
+
+from time_utils import parse_published_at
 
 
 
@@ -93,25 +96,32 @@ async def ensure_sort_neueste(page) -> None:
         # Best-effort only — never block fetching if sorting UI changes.
         return
 
-def load_seen_urls_from_queue(queue_path: Path = Path("queue") / "queue.json") -> Set[str]:
-    """
-    Build a seen_url set from your queue.json if it exists.
-    This gives you "early exit" even when callers pass seen_urls=None.
-    """
+
+
+def load_seen_urls_from_queue(
+    queue_path: Path = Path("queue") / "queue.json",
+    *,
+    queue_db_path: Optional[Path] = None,
+) -> Set[str]:
+    # Prefer DB if provided
+    if queue_db_path is not None and queue_db_path.exists():
+        return queue_db.get_seen_urls(queue_db_path)
+
+    # Fallback to JSON (transition period)
+    if not queue_path.exists():
+        return set()
+
     try:
-        if not queue_path.exists():
-            return set()
-        q = json.loads(queue_path.read_text(encoding="utf-8"))
-        items = q.get("items_by_job_id", {})
-        if not isinstance(items, dict):
-            return set()
-        seen: Set[str] = set()
-        for _, raw in items.items():
-            if isinstance(raw, dict):
-                u = normalize_url(raw.get("url", "") or "")
-                if u:
-                    seen.add(u)
-        return seen
+        doc = json.loads(queue_path.read_text(encoding="utf-8"))
+        items = doc.get("items_by_job_id") or {}
+        out: Set[str] = set()
+        if isinstance(items, dict):
+            for _, it in items.items():
+                if isinstance(it, dict):
+                    url = (it.get("url") or "").strip()
+                    if url:
+                        out.add(url)
+        return out
     except Exception:
         return set()
 
@@ -484,7 +494,10 @@ async def fetch_jobs_async(
         raise RuntimeError(f"Auth state not found at {AUTH_STATE_PATH}. Run login_and_save_state.py first.")
 
     if seen_urls is None:
-        seen_urls = load_seen_urls_from_queue()
+        # Prefer SQLite queue if present; fallback to JSON if not.
+        db_default = Path("queue") / "queue.db"
+        seen_urls = load_seen_urls_from_queue(queue_db_path=db_default)
+
 
     async with async_playwright() as p:
         HEADLESS = False
@@ -558,19 +571,6 @@ async def fetch_jobs_async(
             )
             # ===== ADD OPTION A ENDS HERE =====
 
-
-            # detect "next doesn't change content"
-            if last_first_href and first_href and first_href == last_first_href:
-                stagnant_pages += 1
-            else:
-                stagnant_pages = 0
-            last_first_href = first_href
-
-            # diagnostic: where does the previous page's first_href appear in THIS page's extracted list?
-            if last_first_href:
-                hrefs_only = [item.get("href", "") for item in batch if item.get("href")]
-                prev_idx = hrefs_only.index(last_first_href) if last_first_href in hrefs_only else -1
-            
             # detect "next doesn't change content"
             if last_first_href and first_href and first_href == last_first_href:
                 stagnant_pages += 1
