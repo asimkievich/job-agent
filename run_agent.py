@@ -90,7 +90,7 @@ def main() -> None:
     run_info: Dict[str, Any] = {
         "started_at": now_iso(),
         "cwd": os.getcwd(),
-        "queue_path": str(QUEUE_PATH),
+        "queue_path": str(QUEUE_DB_PATH),
         "ok": False,
     }
 
